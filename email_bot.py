@@ -1,19 +1,19 @@
 """
-AI Product Inspector — Email bot MVP (v2, simpler than WhatsApp)
+AI Product Inspector — Email bot MVP (v3, OpenRouter + Credit-Conscious)
 ===================================================================
 Polls a Gmail inbox for new emails with image attachments, analyzes
-them with Gemini Vision, and auto-replies with a report.
+them with Claude 3.5 Sonnet via OpenRouter, and auto-replies with a report.
 
-SETUP REQUIRED (you do these — see README.md):
+SETUP REQUIRED (you do these):
 1. A Gmail account dedicated to this bot (e.g. inspect@gmail.com)
 2. An "App Password" for that Gmail account (NOT your normal password)
-3. A Gemini API key
+3. An OpenRouter API key (https://openrouter.ai/settings/keys)
 
 Run:
     pip install -r requirements.txt
     export GMAIL_ADDRESS="yourbot@gmail.com"
     export GMAIL_APP_PASSWORD="xxxx xxxx xxxx xxxx"
-    export GEMINI_API_KEY="..."
+    export OPENROUTER_API_KEY="sk-or-..."
     python email_bot.py
 """
 
@@ -28,6 +28,7 @@ import email
 from email.mime.text import MIMEText
 from email.header import decode_header
 import requests
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 from analysis_prompt import ANALYSIS_SYSTEM_PROMPT, build_user_prompt
 
@@ -36,34 +37,70 @@ log = logging.getLogger("email-inspector")
 
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
 
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash-lite:generateContent?key=" + GEMINI_API_KEY
+OPENROUTER_URL = "https://openrouter.ai/api/v1/messages"
+MODEL = "anthropic/claude-3.5-sonnet"
+
+
+def is_retryable_error(exception):
+    """Check if exception is retryable (rate limit 429 or server error 5xx)"""
+    if isinstance(exception, requests.exceptions.HTTPError):
+        status = exception.response.status_code
+        return status == 429 or status >= 500
+    return False
+
+
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=2, min=10, max=30),
+    retry=retry_if_exception(is_retryable_error),
+    reraise=True
 )
-
-
 def analyze_image(image_bytes: bytes, seller_caption: str) -> dict:
+    """Analyze image with Claude 3.5 Sonnet via OpenRouter."""
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
+    
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": ANALYSIS_SYSTEM_PROMPT + "\n\n" + build_user_prompt(seller_caption)},
-                {"inline_data": {"mime_type": "image/jpeg", "data": b64_image}},
-            ]
-        }],
-        "generationConfig": {"temperature": 0.2},
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": ANALYSIS_SYSTEM_PROMPT + "\n\n" + build_user_prompt(seller_caption)
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": b64_image
+                        }
+                    }
+                ]
+            }
+        ],
+        "temperature": 0.2,
     }
-    resp = requests.post(GEMINI_URL, json=payload, timeout=30)
+    
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    
+    resp = requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
-    raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    
+    raw_text = resp.json()["content"][0]["text"]
     clean = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    
     try:
         return json.loads(clean)
     except json.JSONDecodeError:
-        log.error("Failed to parse Gemini response: %s", raw_text)
+        log.error("Failed to parse Claude response: %s", raw_text)
         return {
             "image_quality": "unusable",
             "quality_note": "تعذر تحليل الصورة، حاول مرة أخرى بصورة أوضح",
@@ -150,24 +187,41 @@ def process_inbox():
                     image_bytes = part.get_payload(decode=True)
 
             if image_bytes:
-                result = analyze_image(image_bytes, caption)
-                report = format_report(result)
+                try:
+                    log.info("Analyzing image for %s...", sender)
+                    result = analyze_image(image_bytes, caption)
+                    report = format_report(result)
+                except requests.exceptions.HTTPError as e:
+                    # Catch rate limit errors after retries
+                    if e.response.status_code == 429:
+                        log.warning("Rate limited (429). Skipping email.")
+                        report = "⚠️ خدمة التحليل مشغولة جداً الآن. سيتم إعادة محاولة تحليل صورتك في الدقائق القادمة."
+                    else:
+                        raise
             else:
                 report = "لم أجد صورة مرفقة في رسالتك. أرسل الصورة مع وصف قصير للمنتج."
 
             send_reply(sender, subject, report)
+            log.info("Processed email from %s", sender)
 
         except Exception:
             log.exception("Failed processing email id=%s", eid)
+        
+        # Wait 5 minutes between emails to conserve credits
+        log.info("Waiting 5 minutes before next email processing...")
+        time.sleep(300)
 
     mail.logout()
 
 
 def main():
-    if not all([GMAIL_ADDRESS, GMAIL_APP_PASSWORD, GEMINI_API_KEY]):
+    if not all([GMAIL_ADDRESS, GMAIL_APP_PASSWORD, OPENROUTER_API_KEY]):
         raise SystemExit("Missing required environment variables. Check README.md")
 
-    log.info("AI Product Inspector (email mode) starting. Polling every %ss", POLL_INTERVAL_SECONDS)
+    log.info("🤖 AI Product Inspector (OpenRouter/Claude 3.5 Sonnet) starting")
+    log.info("📧 Gmail: %s", GMAIL_ADDRESS)
+    log.info("⏱️  Polling every %ss | Processing every 5 minutes", POLL_INTERVAL_SECONDS)
+    
     while True:
         try:
             process_inbox()
@@ -178,3 +232,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
