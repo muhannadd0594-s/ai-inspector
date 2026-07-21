@@ -1,20 +1,13 @@
 """
-AI Product Inspector — Email bot MVP (v2, simpler than WhatsApp)
-===================================================================
+AI Product Inspector — Email bot MVP (v2 - OpenRouter)
+=======================================================
 Polls a Gmail inbox for new emails with image attachments, analyzes
-them with Gemini Vision, and auto-replies with a report.
+them with OpenRouter Vision, and auto-replies with a report.
 
-SETUP REQUIRED (you do these — see README.md):
-1. A Gmail account dedicated to this bot (e.g. inspect@gmail.com)
-2. An "App Password" for that Gmail account (NOT your normal password)
-3. A Gemini API key
-
-Run:
-    pip install -r requirements.txt
-    export GMAIL_ADDRESS="yourbot@gmail.com"
-    export GMAIL_APP_PASSWORD="xxxx xxxx xxxx xxxx"
-    export GEMINI_API_KEY="..."
-    python email_bot.py
+SETUP REQUIRED:
+1. Gmail account + App Password
+2. OpenRouter API key (sk-or-...)
+3. Set env vars: GMAIL_ADDRESS, GMAIL_APP_PASSWORD, OPENROUTER_API_KEY
 """
 
 import os
@@ -34,36 +27,45 @@ from analysis_prompt import ANALYSIS_SYSTEM_PROMPT, build_user_prompt
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("email-inspector")
 
-GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
+GMAIL_ADDRESS      = os.environ.get("GMAIL_ADDRESS", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
 
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash-lite:generateContent?key=" + GEMINI_API_KEY
-)
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def analyze_image(image_bytes: bytes, seller_caption: str) -> dict:
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
+
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": ANALYSIS_SYSTEM_PROMPT + "\n\n" + build_user_prompt(seller_caption)},
-                {"inline_data": {"mime_type": "image/jpeg", "data": b64_image}},
-            ]
-        }],
-        "generationConfig": {"temperature": 0.2},
+        "model": "google/gemini-2.0-flash-001",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": ANALYSIS_SYSTEM_PROMPT + "\n\n" + build_user_prompt(seller_caption)},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
+                ],
+            }
+        ],
+        "temperature": 0.2,
     }
-    resp = requests.post(GEMINI_URL, json=payload, timeout=30)
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    resp = requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=30)
     resp.raise_for_status()
-    raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    raw_text = resp.json()["choices"][0]["message"]["content"]
     clean = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
     try:
         return json.loads(clean)
     except json.JSONDecodeError:
-        log.error("Failed to parse Gemini response: %s", raw_text)
+        log.error("Failed to parse response: %s", raw_text)
         return {
             "image_quality": "unusable",
             "quality_note": "تعذر تحليل الصورة، حاول مرة أخرى بصورة أوضح",
@@ -82,7 +84,12 @@ def format_report(result: dict) -> str:
     observations = result.get("observations", [])
     if observations:
         for obs in observations:
-            icon = {"damage": "[تلف]", "discrepancy": "[تعارض]", "inconsistency": "[ملاحظة]", "note": "[معلومة]"}.get(obs["type"], "-")
+            icon = {
+                "damage": "[تلف]",
+                "discrepancy": "[تعارض]",
+                "inconsistency": "[ملاحظة]",
+                "note": "[معلومة]"
+            }.get(obs["type"], "-")
             lines.append(f"{icon} {obs['description']}")
     else:
         lines.append("لم يلاحظ النظام أي مشاكل ظاهرة في الصورة.")
@@ -112,7 +119,8 @@ def decode_mime_words(s):
         return ""
     decoded = decode_header(s)
     return "".join(
-        (t.decode(enc or "utf-8") if isinstance(t, bytes) else t) for t, enc in decoded
+        (t.decode(enc or "utf-8") if isinstance(t, bytes) else t)
+        for t, enc in decoded
     )
 
 
@@ -135,7 +143,7 @@ def process_inbox():
             raw = msg_data[0][1]
             msg = email.message_from_bytes(raw)
 
-            sender = email.utils.parseaddr(msg.get("From"))[1]
+            sender  = email.utils.parseaddr(msg.get("From"))[1]
             subject = decode_mime_words(msg.get("Subject"))
             caption = ""
             image_bytes = None
@@ -152,6 +160,7 @@ def process_inbox():
             if image_bytes:
                 result = analyze_image(image_bytes, caption)
                 report = format_report(result)
+                log.info("Analysis done for %s", sender)
             else:
                 report = "لم أجد صورة مرفقة في رسالتك. أرسل الصورة مع وصف قصير للمنتج."
 
@@ -164,8 +173,8 @@ def process_inbox():
 
 
 def main():
-    if not all([GMAIL_ADDRESS, GMAIL_APP_PASSWORD, GEMINI_API_KEY]):
-        raise SystemExit("Missing required environment variables. Check README.md")
+    if not all([GMAIL_ADDRESS, GMAIL_APP_PASSWORD, OPENROUTER_API_KEY]):
+        raise SystemExit("Missing required environment variables: GMAIL_ADDRESS, GMAIL_APP_PASSWORD, OPENROUTER_API_KEY")
 
     log.info("AI Product Inspector (email mode) starting. Polling every %ss", POLL_INTERVAL_SECONDS)
     while True:
