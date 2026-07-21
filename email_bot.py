@@ -46,6 +46,7 @@ GEMINI_URL = (
 
 
 def analyze_image(image_bytes: bytes, seller_caption: str) -> dict:
+    """Analyze image with exponential backoff retry on rate limit (429)."""
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
     payload = {
         "contents": [{
@@ -56,21 +57,44 @@ def analyze_image(image_bytes: bytes, seller_caption: str) -> dict:
         }],
         "generationConfig": {"temperature": 0.2},
     }
-    resp = requests.post(GEMINI_URL, json=payload, timeout=30)
-    resp.raise_for_status()
-    raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    clean = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    try:
-        return json.loads(clean)
-    except json.JSONDecodeError:
-        log.error("Failed to parse Gemini response: %s", raw_text)
-        return {
-            "image_quality": "unusable",
-            "quality_note": "تعذر تحليل الصورة، حاول مرة أخرى بصورة أوضح",
-            "observations": [],
-            "seller_claim_check": "cannot_confirm",
-            "summary_for_user": "حدث خطأ تقني في التحليل. أعد إرسال الصورة من فضلك.",
-        }
+    
+    # Retry with exponential backoff on 429 errors
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(GEMINI_URL, json=payload, timeout=30)
+            resp.raise_for_status()
+            raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            clean = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            try:
+                return json.loads(clean)
+            except json.JSONDecodeError:
+                log.error("Failed to parse Gemini response: %s", raw_text)
+                return {
+                    "image_quality": "unusable",
+                    "quality_note": "تعذر تحليل الصورة، حاول مرة أخرى بصورة أوضح",
+                    "observations": [],
+                    "seller_claim_check": "cannot_confirm",
+                    "summary_for_user": "حدث خطأ تقني في التحليل. أعد إرسال الصورة من فضلك.",
+                }
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:  # Rate limit error
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 10  # 10s, 20s, 40s
+                    log.warning("Rate limited (429). Retrying in %ds (attempt %d/%d)", wait_time, attempt + 1, max_retries)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    log.error("Rate limited after %d retries. Giving up.", max_retries)
+                    return {
+                        "image_quality": "unusable",
+                        "quality_note": "النظام مشغول جداً حالياً. حاول لاحقاً من فضلك",
+                        "observations": [],
+                        "seller_claim_check": "cannot_confirm",
+                        "summary_for_user": "خدمة Gemini مشغولة جداً. سيتم المحاولة في الدقائق القادمة.",
+                    }
+            else:
+                raise
 
 
 def format_report(result: dict) -> str:
@@ -178,3 +202,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
