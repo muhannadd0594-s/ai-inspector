@@ -28,6 +28,7 @@ import email
 from email.mime.text import MIMEText
 from email.header import decode_header
 import requests
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 from analysis_prompt import ANALYSIS_SYSTEM_PROMPT, build_user_prompt
 
@@ -45,7 +46,22 @@ GEMINI_URL = (
 )
 
 
+def is_rate_limit_error(exception):
+    """Check if exception is a rate limit (429) or server error (5xx)"""
+    if isinstance(exception, requests.exceptions.HTTPError):
+        status = exception.response.status_code
+        return status == 429 or status >= 500
+    return False
+
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=4, max=60),
+    retry=retry_if_exception(is_rate_limit_error),
+    reraise=True
+)
 def analyze_image(image_bytes: bytes, seller_caption: str) -> dict:
+    """Analyze image with automatic retry on rate limit (429) and server errors."""
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
     payload = {
         "contents": [{
@@ -57,6 +73,13 @@ def analyze_image(image_bytes: bytes, seller_caption: str) -> dict:
         "generationConfig": {"temperature": 0.2},
     }
     resp = requests.post(GEMINI_URL, json=payload, timeout=30)
+    
+    # Honor Retry-After header if present
+    if resp.status_code == 429 and "Retry-After" in resp.headers:
+        retry_after = float(resp.headers["Retry-After"])
+        log.warning("Rate limited (429). Retrying after %s seconds", retry_after)
+        time.sleep(retry_after)
+    
     resp.raise_for_status()
     raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     clean = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -150,8 +173,16 @@ def process_inbox():
                     image_bytes = part.get_payload(decode=True)
 
             if image_bytes:
-                result = analyze_image(image_bytes, caption)
-                report = format_report(result)
+                try:
+                    result = analyze_image(image_bytes, caption)
+                    report = format_report(result)
+                except requests.exceptions.HTTPError as e:
+                    # Catch rate limit errors after retries fail
+                    if e.response.status_code == 429:
+                        log.warning("Rate limited after retries. Skipping email and waiting before next poll.")
+                        report = "⚠️ خدمة التحليل مشغولة جداً الآن. سيتم إعادة محاولة تحليل صورتك في الدقائق القادمة. شكراً على صبرك!"
+                    else:
+                        raise
             else:
                 report = "لم أجد صورة مرفقة في رسالتك. أرسل الصورة مع وصف قصير للمنتج."
 
@@ -159,6 +190,9 @@ def process_inbox():
 
         except Exception:
             log.exception("Failed processing email id=%s", eid)
+        
+        # Proactive throttling: wait 4.5s between emails to stay under 15 RPM limit
+        time.sleep(4.5)
 
     mail.logout()
 
@@ -178,3 +212,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
