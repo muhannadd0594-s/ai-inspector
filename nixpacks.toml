@@ -1,0 +1,2 @@
+[start]
+cmd = "python email_bot.py"
