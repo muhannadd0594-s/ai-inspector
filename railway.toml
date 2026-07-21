@@ -1,2 +1,0 @@
-[deploy]
-startCommand = "python email_bot.py"
