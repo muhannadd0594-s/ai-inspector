@@ -39,7 +39,7 @@ def analyze_image(image_bytes: bytes, seller_caption: str) -> dict:
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
 
     payload = {
-        "model": "google/gemini-2.0-flash-001",
+        "model": "google/gemini-2.5-flash",
         "messages": [
             {
                 "role": "user",
