@@ -15,12 +15,22 @@ import time
 import json
 import base64
 import logging
+import socket
 import imaplib
 import smtplib
 import email
 from email.mime.text import MIMEText
 from email.header import decode_header
 import requests
+
+# --- Fix for Railway/Docker environments where IPv6 routes exist but are
+# unreachable, causing "OSError: [Errno 101] Network is unreachable" on
+# smtplib/imaplib connections. Force all socket lookups to IPv4 only. ---
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_only_getaddrinfo(*args, **kwargs):
+    responses = _orig_getaddrinfo(*args, **kwargs)
+    return [r for r in responses if r[0] == socket.AF_INET] or responses
+socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 from analysis_prompt import ANALYSIS_SYSTEM_PROMPT, build_user_prompt
 
