@@ -118,7 +118,8 @@ def send_reply(to_address: str, subject: str, body: str):
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = to_address
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
+        server.starttls()
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_ADDRESS, [to_address], msg.as_string())
     log.info("Replied to %s", to_address)
